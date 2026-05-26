@@ -205,6 +205,9 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+<<<<<<< HEAD
 
 
 data/*
+=======
+>>>>>>> ad0786f7581526f2a27d05f978856c7a2c225a54
