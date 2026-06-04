@@ -103,7 +103,6 @@ class DataIngestor:
 
         data = data.loc[(data["timestamp"] >= self.start_date) & (data["timestamp"] <= self.end_date)]
 
-        # Filtra per follower
         before = len(data)
         data = data.loc[data["user_followers"] >= min_followers]
         print(f"   Filtro follower >= {min_followers}: {before:,} → {len(data):,} tweet")
