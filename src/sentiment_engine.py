@@ -3,10 +3,12 @@ import time
 import json
 import os
 
+import numpy as np
 from google import genai
 from google.genai import errors as genai_errors
 import pandas as pd
 from bs4 import BeautifulSoup
+
 
 class SentimentEngine:
     def __init__(self, api_key: str, model: str = "gemini-3.1-flash-lite"):
@@ -83,7 +85,7 @@ class SentimentEngine:
                 )
                 time.sleep(retry_delay)
 
-        return [{"id": i + 1, "score": 0.0, "label": "neutral"} for i in range(len(tweets))]
+        return [{"id": i + 1, "score": 0.0, "label": "neutral", "failed": True} for i in range(len(tweets))]
 
     def analyze(
         self,
@@ -128,9 +130,13 @@ class SentimentEngine:
             for r in results:
                 idx = i + r["id"] - 1
                 if idx < len(df):
-                    scores[idx] = r["score"]
-                    labels[idx] = r["label"]
-                    results_cache[idx] = {"score": r["score"], "label": r["label"]}
+                    if r.get("failed"):
+                        scores[idx] = 0.0
+                        labels[idx] = "neutral"
+                    else:
+                        scores[idx] = r["score"]
+                        labels[idx] = r["label"]
+                        results_cache[idx] = {"score": r["score"], "label": r["label"]}
 
             with open(checkpoint_path, "w") as f:
                 json.dump(results_cache, f)
@@ -151,7 +157,7 @@ class SentimentEngine:
                         (g["sentiment_score"] * g["user_followers"]).sum()
                         / g["user_followers"].sum()
                         if g["user_followers"].sum() > 0
-                        else 0
+                        else float("nan")
                     ),
                     "positive_pct": (g["sentiment_label"] == "positive").mean() * 100,
                     "negative_pct": (g["sentiment_label"] == "negative").mean() * 100,
@@ -166,3 +172,115 @@ class SentimentEngine:
         print(f"\n   Salvato in {output_path}")
 
         return weekly
+
+    def compute_rsi(self, prices: pd.Series, window: int = 14) -> pd.Series:
+        delta = prices.diff()
+        gain  = delta.clip(lower=0).rolling(window).mean()
+        loss  = (-delta.clip(upper=0)).rolling(window).mean()
+        rs    = gain / loss.replace(0, np.nan)
+        return 100 - (100 / (1 + rs))
+
+    def compute_macd(
+        self,
+        prices: pd.Series,
+        fast: int = 12,
+        slow: int = 26,
+        signal: int = 9,
+    ) -> pd.DataFrame:
+        ema_fast    = prices.ewm(span=fast,   adjust=False).mean()
+        ema_slow    = prices.ewm(span=slow,   adjust=False).mean()
+        macd_line   = ema_fast - ema_slow
+        signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+        return pd.DataFrame({
+            "macd":        macd_line,
+            "macd_signal": signal_line,
+            "macd_hist":   macd_line - signal_line,
+        })
+
+    def compute_sharpe(
+        self,
+        returns: pd.Series,
+        window: int = 4,
+        risk_free: float = 0.0,
+    ) -> pd.Series:
+        excess = returns - risk_free / 52
+        return (
+            excess.rolling(window).mean()
+            / excess.rolling(window).std()
+            * np.sqrt(52)
+        )
+
+    def compute_technical_features(self, df_market: pd.DataFrame) -> pd.DataFrame:
+        close   = df_market["Close"]
+        returns = close.pct_change().rename("return_w")
+
+        feats = pd.DataFrame(index=df_market.index)
+        feats["log_return"]   = np.log1p(returns)
+        feats["volatility_w"] = returns.rolling(4).std()
+        feats["rsi_14"]       = self.compute_rsi(close)
+        feats[["macd", "macd_signal", "macd_hist"]] = self.compute_macd(close)
+        feats["sharpe_4w"]    = self.compute_sharpe(returns)
+        feats["volume_norm"]  = (
+            df_market["Volume"] / df_market["Volume"].rolling(4).mean()
+        )
+        return feats
+
+    def compute_sentiment_features(
+        self,
+        df_social: pd.DataFrame,
+        freq: str = "W",
+        **analyze_kwargs,
+    ) -> pd.DataFrame:
+        weekly = self.analyze(df_social, **analyze_kwargs)
+
+        full_idx = pd.date_range(
+            start=weekly.index.min(),
+            end=weekly.index.max(),
+            freq=freq,
+        )
+        weekly = weekly.reindex(full_idx)
+        weekly["has_data"]   = (weekly["tweet_count"] > 0).astype(int)
+        weekly["tweet_count"] = weekly["tweet_count"].fillna(0)
+
+        cols_to_interpolate = [
+            "sentiment_score_mean", "sentiment_score_weighted",
+            "positive_pct", "negative_pct",
+        ]
+        weekly[cols_to_interpolate] = (
+            weekly[cols_to_interpolate]
+            .interpolate(method="linear", limit_direction="both")
+        )
+        weekly.index.name = "timestamp"
+
+        output_path = os.path.join(self.output_dir, "bitcoin_sentiment.csv")
+        weekly.to_csv(output_path)
+        print(f"   CSV aggiornato con gap filling → {output_path}")
+
+        return weekly
+
+    def compute_energy_features(self, df_energy: pd.DataFrame) -> pd.DataFrame:
+        feats = pd.DataFrame(index=df_energy.index)
+        feats["cost_per_btc"]       = df_energy["cost_per_btc_usd"]
+        feats["cost_per_btc_delta"] = df_energy["cost_per_btc_usd"].pct_change()
+        if "hash_rate_ths" in df_energy.columns:
+            feats["hash_rate_norm"] = (
+                df_energy["hash_rate_ths"]
+                / df_energy["hash_rate_ths"].rolling(4).mean()
+            )
+        return feats
+
+    def build_feature_matrix(
+        self,
+        df_market:  pd.DataFrame,
+        df_social:  pd.DataFrame,
+        df_energy:  pd.DataFrame,
+        **analyze_kwargs,
+    ) -> pd.DataFrame:
+        tech   = self.compute_technical_features(df_market)
+        social = self.compute_sentiment_features(df_social, **analyze_kwargs)
+        energy = self.compute_energy_features(df_energy)
+
+        matrix = tech.join(social, how="left").join(energy, how="left")
+        matrix = matrix.ffill(limit=1)
+        matrix = matrix.iloc[:-1]
+        return matrix
