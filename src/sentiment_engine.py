@@ -246,9 +246,12 @@ class SentimentEngine:
             "sentiment_score_mean", "sentiment_score_weighted",
             "positive_pct", "negative_pct",
         ]
+        # FIX leakage: l'interpolazione lineare con limit_direction="both" riempiva i buchi
+        # usando anche osservazioni FUTURE (guardava avanti nel tempo). Sostituito con un
+        # forward-fill puro (causale, limitato a poche settimane), coerente con quanto già
+        # fatto manualmente in train.ipynb per gli stessi dati.
         weekly[cols_to_interpolate] = (
-            weekly[cols_to_interpolate]
-            .interpolate(method="linear", limit_direction="both")
+            weekly[cols_to_interpolate].ffill(limit=4).fillna(0)
         )
         weekly.index.name = "timestamp"
 
@@ -257,6 +260,22 @@ class SentimentEngine:
         print(f"   CSV aggiornato con gap filling → {output_path}")
 
         return weekly
+
+    def compute_sentiment_momentum(
+        self,
+        df_sentiment: pd.DataFrame,
+        window: int = 4,
+        col: str = "sentiment_score_mean",
+    ) -> pd.Series:
+        """Differenza tra il sentiment della settimana corrente e la media mobile
+        delle `window` settimane precedenti (esclusa quella corrente).
+
+        Causale per costruzione: `.shift(1)` esclude la settimana corrente dalla
+        baseline prima di applicare `.rolling(window)`, quindi ogni valore usa
+        solo dati strettamente passati rispetto alla settimana a cui si riferisce.
+        """
+        baseline = df_sentiment[col].shift(1).rolling(window).mean()
+        return (df_sentiment[col] - baseline).rename(f"{col}_momentum_{window}w")
 
     def compute_energy_features(self, df_energy: pd.DataFrame) -> pd.DataFrame:
         feats = pd.DataFrame(index=df_energy.index)
